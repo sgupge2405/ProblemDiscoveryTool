@@ -1,0 +1,259 @@
+# evaluation/tool_b.py
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Sequence
+
+import pandas as pd
+
+from evaluation.loader import TrialRecord
+from evaluation.text_normalize import normalize_text
+from evaluation.llm_labeler import LLMLabeler, LabelerConfig
+
+
+# 自動インタビューで変動する評価対象（explanationのみ）
+EXPLANATION_FIELDS = [
+    "target_user_explanation",
+    "problem_explanation",
+    "contradiction_explanation",
+    "objective_explanation",
+    "value_explanation",
+]
+
+
+def _load_meaning_keys(categories_path: Path) -> List[str]:
+    cfg = json.loads(categories_path.read_text(encoding="utf-8"))
+    return [c["key"] for c in cfg["meaning_categories"]]
+
+
+def _normalized_entropy_from_vector(vec: List[int]) -> float:
+    """
+    vec（カテゴリ合計スコアのベクトル）から正規化エントロピーを算出する（0..1）
+    - total=0 の場合は 0.0
+    - p_i = v_i / sum(v)
+    - H = -sum p_i log(p_i)
+    - H_norm = H / log(K)  (K=len(vec))
+    """
+    k = len(vec)
+    if k <= 1:
+        return 0.0
+    total = sum(vec)
+    if total <= 0:
+        return 0.0
+
+    ps = [v / total for v in vec if v > 0]
+    h = -sum(p * math.log(p) for p in ps)
+    h_max = math.log(k)
+    return float(h / h_max) if h_max > 0 else 0.0
+
+
+@dataclass
+class ToolBScoreOutputs:
+    # sample_id × category_score_sum（+ total_score / normalized_entropy_* 等を含む）
+    category_sum_df: pd.DataFrame
+
+    # sample_id × 指標（主指標H_no_activity + 補助指標activity_* + 参考H_all）
+    entropy_df: pd.DataFrame
+
+    # sample_id × field × category_score（横持ち）
+    field_detail_df: pd.DataFrame
+
+    report: Dict[str, Any]
+
+
+def run_tool_b_meaning_scores(
+    trials: Sequence[TrialRecord],
+    *,
+    prompt_path: Path,
+    categories_path: Path,
+    outputs_dir: Path,
+    temperature: float = 0.2,
+    max_retries: int = 2,
+) -> ToolBScoreOutputs:
+    """
+    ツールB1（IR網羅性：意味カテゴリスコア + 正規化エントロピー）
+    目的：
+    - IRの explanation に含まれる情報が、意味カテゴリにどれだけ分布しているかを定量化する。
+
+    出力：
+    1) category_sum_df：sample_id×category_score_sum（+ total_score）
+    2) entropy_df：
+       - normalized_entropy_no_activity（主指標：Activity除外、K=11）
+       - normalized_entropy_all（参考：全カテゴリ、K=12）
+       - activity_sum / activity_mean / activity_ratio（補助指標：Activity飽和率系）
+    3) field_detail_df：sample_id×field×category_score（横持ち）
+
+    sample_id：
+    - 自動インタビューのtrial番号は再起動等でリセットされ得るため、本ツールでは ZIP名を sample_id として用いる。
+
+    ログ（追記式）：
+    - outputs_dir/tool_b_labels.jsonl
+    - outputs_dir/tool_b_errors.jsonl
+    """
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    out_jsonl = outputs_dir / "tool_b_labels.jsonl"
+    err_jsonl = outputs_dir / "tool_b_errors.jsonl"
+
+    meaning_keys = _load_meaning_keys(categories_path)
+
+    labeler = LLMLabeler(
+        LabelerConfig(
+            prompt_path=prompt_path,
+            categories_path=categories_path,
+            temperature=temperature,
+            max_retries=max_retries,
+        )
+    )
+
+    # 詳細（sample_id×field×category）横持ち行
+    detail_rows: List[Dict[str, Any]] = []
+
+    # 合計（sample_id×category）を辞書で集計
+    sum_map: Dict[str, Dict[str, int]] = {}
+
+    for t in trials:
+        sample_id = t.zip_name
+        meta = dict(t.meta or {})
+        meta.update({"run_id": t.run_id})
+
+        if sample_id not in sum_map:
+            sum_map[sample_id] = {k: 0 for k in meaning_keys}
+
+        for field in EXPLANATION_FIELDS:
+            raw = t.objective_card.get(field)
+            text = normalize_text(raw)
+            if not text:
+                continue
+
+            out = labeler.label_meaning_scores(
+                sample_id=sample_id,
+                text_id=field,
+                raw_text=text,
+                meta=meta,
+                out_jsonl=out_jsonl,
+                err_jsonl=err_jsonl,
+            )
+            if not out:
+                continue
+
+            scores: Dict[str, int] = out["scores"]
+
+            # field詳細（横持ち1行）
+            row = {"sample_id": sample_id, "field": field}
+            for k in meaning_keys:
+                v = int(scores.get(k, 0))
+                row[k] = v
+                sum_map[sample_id][k] += v
+            detail_rows.append(row)
+
+    # (1) sample_id × category_score_sum（横持ち）
+    sum_rows: List[Dict[str, Any]] = []
+    for sample_id, d in sum_map.items():
+        r = {"sample_id": sample_id}
+        for k in meaning_keys:
+            r[k] = int(d.get(k, 0))
+        r["total_score"] = int(sum(d.get(k, 0) for d in [d] for k in meaning_keys))
+        # ↑一見変ですが可読性のため。実際は下の方が普通：
+        # r["total_score"] = int(sum(d.get(k, 0) for k in meaning_keys))
+        r["total_score"] = int(sum(d.get(k, 0) for k in meaning_keys))
+        sum_rows.append(r)
+
+    category_sum_df = pd.DataFrame(sum_rows)
+
+    # (2) 指標：entropy（主）+ Activity飽和率（補助）+ entropy（参考）
+    activity_key = "Activity"
+    keys_no_activity = [k for k in meaning_keys if k != activity_key]
+
+    entropy_rows: List[Dict[str, Any]] = []
+    for _, row in category_sum_df.iterrows():
+        sample_id = row["sample_id"]
+        total_score = int(row["total_score"])
+
+        # entropy（参考：全カテゴリK=12）
+        vec_all = [int(row[k]) for k in meaning_keys]
+        h_all = _normalized_entropy_from_vector(vec_all)
+
+        # entropy（主：Activity除外K=11）
+        vec_no_act = [int(row[k]) for k in keys_no_activity]
+        h_no_act = _normalized_entropy_from_vector(vec_no_act)
+
+        # Activity飽和率（補助）
+        act_sum = int(row[activity_key]) if activity_key in category_sum_df.columns else 0
+        # 5フィールド × スコア最大3 = 15（この上限は固定）
+        act_max = len(EXPLANATION_FIELDS) * 3
+        act_mean = float(act_sum / len(EXPLANATION_FIELDS)) if len(EXPLANATION_FIELDS) > 0 else 0.0
+        act_ratio_total = float(act_sum / total_score) if total_score > 0 else 0.0
+        act_saturation = float(act_sum / act_max) if act_max > 0 else 0.0
+
+        entropy_rows.append(
+            {
+                "sample_id": sample_id,
+                "normalized_entropy_no_activity": float(h_no_act),  # 主指標
+                "normalized_entropy_all": float(h_all),              # 参考
+                "total_score": total_score,
+                "activity_sum": act_sum,
+                "activity_mean": float(act_mean),
+                "activity_ratio": float(act_ratio_total),            # Activity / total_score
+                "activity_saturation": float(act_saturation),        # Activity / 15
+            }
+        )
+
+    entropy_df = pd.DataFrame(entropy_rows)
+
+    # (3) sample_id × field × category_score
+    field_detail_df = pd.DataFrame(detail_rows)
+
+    # category_sum_df に主指標を併記（便利）
+    if not category_sum_df.empty and not entropy_df.empty:
+        category_sum_df = category_sum_df.merge(
+            entropy_df[["sample_id", "normalized_entropy_no_activity", "normalized_entropy_all",
+                        "activity_sum", "activity_mean", "activity_ratio", "activity_saturation"]],
+            on="sample_id",
+            how="left",
+        )
+
+    report = {
+        "tool": "tool_b1_ir_coverage",
+        "sample_id_policy": "zip_name",
+        "target": "objective_card.*_explanation only",
+        "meaning_categories": meaning_keys,
+        "score_scale": "0..3 (0 none, 3 strong)",
+        "metrics": {
+            "primary": "normalized_entropy_no_activity (K=11, Activity excluded)",
+            "reference": "normalized_entropy_all (K=12)",
+            "aux": [
+                "activity_sum",
+                "activity_mean",
+                "activity_ratio (= activity_sum / total_score)",
+                "activity_saturation (= activity_sum / 15)",
+            ],
+            "entropy_definition": "H_norm = (-sum p_i log p_i) / log(K), p_i = s_i / sum(s)",
+            "entropy_range": "0..1 (0 concentrated, 1 uniform)",
+        },
+        "llm": {
+            "model": "MODEL_NAME from chains.py",
+            "prompt": str(prompt_path),
+            "categories": str(categories_path),
+            "temperature": float(temperature),
+            "max_retries": int(max_retries),
+        },
+        "outputs": {
+            "labels_jsonl": str(out_jsonl),
+            "errors_jsonl": str(err_jsonl),
+        },
+        "notes": [
+            "category_sum_df: sample_id×カテゴリ合計（+ total_score + 指標列）",
+            "entropy_df: sample_id×指標（主/参考/補助）",
+            "field_detail_df: sample_id×field×カテゴリスコア（横持ち）",
+        ],
+    }
+
+    return ToolBScoreOutputs(
+        category_sum_df=category_sum_df,
+        entropy_df=entropy_df,
+        field_detail_df=field_detail_df,
+        report=report,
+    )

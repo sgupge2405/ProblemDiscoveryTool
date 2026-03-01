@@ -1,0 +1,192 @@
+# evaluation/llm_labeler_b2_answer.py
+from __future__ import annotations
+
+import json
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional, List
+
+from chains import call_llm, MODEL_NAME
+from evaluation.text_normalize import normalize_text
+
+
+def _sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _extract_json_object(text: str) -> Optional[str]:
+    if not isinstance(text, str):
+        return None
+    s = text.strip()
+    if not s:
+        return None
+    if s.startswith("{") and s.endswith("}"):
+        return s
+    start = s.find("{")
+    end = s.rfind("}")
+    if 0 <= start < end:
+        cand = s[start : end + 1].strip()
+        if cand.startswith("{") and cand.endswith("}"):
+            return cand
+    return None
+
+
+def _safe_json_loads(s: str) -> Optional[Dict[str, Any]]:
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _load_deepdive_keys(categories_path: Path) -> List[str]:
+    cfg = json.loads(categories_path.read_text(encoding="utf-8"))
+    return [c["key"] for c in cfg["deepdive_categories"]]
+
+
+@dataclass
+class LabelerB2AnswerConfig:
+    prompt_path: Path
+    categories_path: Path
+    temperature: float = 0.2
+    max_retries: int = 2
+    max_labels: int = 3  # 回答側 multi-label の上限
+
+
+class LLMLabelerB2Answer:
+    """
+    回答文→深掘りカテゴリ(複数, 最大max_labels) を付与する。
+    """
+
+    def __init__(self, cfg: LabelerB2AnswerConfig):
+        self.cfg = cfg
+        self.prompt_template = cfg.prompt_path.read_text(encoding="utf-8")
+        self.categories_json_text = cfg.categories_path.read_text(encoding="utf-8")
+
+        self.deepdive_keys = _load_deepdive_keys(cfg.categories_path)
+
+        self.prompt_sha256 = _sha256_text(self.prompt_template)
+        self.categories_sha256 = _sha256_text(self.categories_json_text)
+
+    def build_prompt(self, text: str) -> str:
+        return (
+            self.prompt_template
+            .replace("{CATEGORIES_JSON}", self.categories_json_text)
+            .replace("{TEXT}", text)
+        )
+
+    def _validate_categories(self, cats: Any) -> List[str]:
+        if not isinstance(cats, list):
+            return []
+        out: List[str] = []
+        for c in cats:
+            if not isinstance(c, str):
+                continue
+            c = c.strip()
+            if c in self.deepdive_keys and c not in out:
+                out.append(c)
+            if len(out) >= int(self.cfg.max_labels):
+                break
+        return out
+
+    def _validate_rationales(self, rats: Any) -> Dict[str, str]:
+        if not isinstance(rats, dict):
+            return {}
+        out: Dict[str, str] = {}
+        for k, v in rats.items():
+            if not isinstance(k, str):
+                continue
+            if k not in self.deepdive_keys:
+                continue
+            if isinstance(v, str):
+                out[k] = v
+        return out
+
+    def label_answer_multilabel(
+        self,
+        *,
+        sample_id: str,
+        turn: int,
+        answer_text: Any,
+        meta: Dict[str, Any],
+        out_jsonl: Path,
+        err_jsonl: Path,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        1回答を深掘りカテゴリ(複数)に分類。
+        成功：{"categories": [..], "rationales": {...}}
+        失敗：None（errors.jsonlに記録）
+        """
+        text = normalize_text(answer_text)
+        if not text:
+            return {"categories": ["Extras"], "rationales": {}}
+
+        prompt = self.build_prompt(text)
+
+        last_raw = None
+        for attempt in range(self.cfg.max_retries + 1):
+            try:
+                resp = call_llm(
+                    MODEL_NAME,
+                    system_prompt=prompt,
+                    user_text="",
+                    temperature=self.cfg.temperature,
+                )
+                last_raw = resp
+
+                js = _extract_json_object(resp)
+                if js is None:
+                    raise ValueError("JSON_NOT_FOUND")
+
+                obj = _safe_json_loads(js)
+                if obj is None:
+                    raise ValueError("JSON_PARSE_FAILED")
+
+                cats = self._validate_categories(obj.get("categories"))
+                rats = self._validate_rationales(obj.get("rationales"))
+
+                # 0件なら Extras を入れておく（空でも良いが集計が楽）
+                if not cats:
+                    cats = ["Extras"]
+
+                record = {
+                    "sample_id": sample_id,
+                    "kind": "deepdive_answer_multilabel",
+                    "turn": int(turn),
+                    "input": text,
+                    "output": {"categories": cats, "rationales": rats},
+                    "meta": meta,
+                    "provenance": {
+                        "model": MODEL_NAME,
+                        "prompt_name": self.cfg.prompt_path.name,
+                        "prompt_sha256": self.prompt_sha256,
+                        "categories_name": self.cfg.categories_path.name,
+                        "categories_sha256": self.categories_sha256,
+                        "max_labels": int(self.cfg.max_labels),
+                    },
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+                with out_jsonl.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+                return {"categories": cats, "rationales": rats}
+
+            except Exception as e:
+                if attempt >= self.cfg.max_retries:
+                    err = {
+                        "sample_id": sample_id,
+                        "kind": "deepdive_answer_multilabel",
+                        "turn": int(turn),
+                        "error": str(e),
+                        "raw_response": last_raw,
+                        "meta": meta,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    err_jsonl.parent.mkdir(parents=True, exist_ok=True)
+                    with err_jsonl.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(err, ensure_ascii=False) + "\n")
+                    return None
+                continue

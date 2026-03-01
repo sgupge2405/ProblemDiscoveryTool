@@ -1,0 +1,120 @@
+# pages/5_評価ツールB1.py
+import io
+import json
+import zipfile
+from pathlib import Path
+from datetime import datetime
+
+import streamlit as st
+
+from evaluation.loader import load_trials_from_uploaded_files
+from evaluation.tool_b1 import run_tool_b_meaning_scores
+
+
+st.set_page_config(page_title="評価ツールB1（IR網羅性）", layout="wide")
+st.title("評価実験ツールB1（IR網羅性：意味カテゴリスコア＋正規化エントロピー）")
+
+st.caption(
+    "対象：objective_card.*_explanation（explanationのみ）／"
+    "sample_id：ZIP名（trial番号は用いない）／"
+    "主指標：Activity除外の正規化エントロピー"
+)
+
+# -----------------------------
+# Upload
+# -----------------------------
+files = st.file_uploader(
+    "run_*.zip を複数選択してアップロード",
+    type=["zip"],
+    accept_multiple_files=True,
+)
+
+# -----------------------------
+# Settings
+# -----------------------------
+with st.expander("設定", expanded=True):
+    prompt_path = st.text_input("prompt path", "prompts/tool_b_meaning.txt").strip()
+    categories_path = st.text_input("categories path", "configs/tool_b_categories.json").strip()
+
+    default_out = f"outputs/tool_b1_ir_coverage/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    outputs_dir = st.text_input("outputs dir", default_out).strip()
+
+    temperature = st.number_input("temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
+    max_retries = st.number_input("max_retries", min_value=0, max_value=5, value=2, step=1)
+
+    st.info("outputs dir は実験ごとに変えるのがおすすめです（jsonlが追記で増えます）。")
+
+if not files:
+    st.info("ZIPをアップロードしてください。")
+    st.stop()
+
+# -----------------------------
+# Load trials
+# -----------------------------
+try:
+    trials = load_trials_from_uploaded_files(files)
+except Exception as e:
+    st.error("ZIPの読み込みに失敗しました。")
+    st.exception(e)
+    st.stop()
+
+st.success(f"読み込み成功：{len(trials)} サンプル（ZIP）")
+
+with st.expander("アップロードされたZIP一覧", expanded=False):
+    st.write([t.zip_name for t in trials])
+
+# -----------------------------
+# Run
+# -----------------------------
+run_clicked = st.button("評価を実行", type="primary")
+
+if run_clicked:
+    try:
+        with st.status("評価を実行中…（LLM分類のため時間がかかります）", expanded=True) as status:
+            st.write("explanation抽出 → 正規化 → 意味カテゴリスコア付与 → 集計 → エントロピー（主/参考）＋Activity補助指標算出")
+            res = run_tool_b_meaning_scores(
+                trials,
+                prompt_path=Path(prompt_path),
+                categories_path=Path(categories_path),
+                outputs_dir=Path(outputs_dir),
+                temperature=float(temperature),
+                max_retries=int(max_retries),
+            )
+            status.update(label="完了", state="complete", expanded=False)
+
+    except Exception as e:
+        st.error("評価の実行に失敗しました。")
+        st.exception(e)
+        st.stop()
+
+    # -----------------------------
+    # Show results
+    # -----------------------------
+    st.subheader("coverage（主指標：normalized_entropy_no_activity）＋Activity補助指標")
+    st.dataframe(res.entropy_df, use_container_width=True)
+
+    st.subheader("category_sum（sample_id×category_score_sum）")
+    st.dataframe(res.category_sum_df, use_container_width=True)
+
+    st.subheader("field_detail（sample_id×field×category_score）")
+    st.dataframe(res.field_detail_df, use_container_width=True)
+
+    # -----------------------------
+    # Download ZIP
+    # -----------------------------
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("tool_b1_entropy.csv", res.entropy_df.to_csv(index=False, encoding="utf-8-sig"))
+        zf.writestr("tool_b1_category_sum.csv", res.category_sum_df.to_csv(index=False, encoding="utf-8-sig"))
+        zf.writestr("tool_b1_field_detail.csv", res.field_detail_df.to_csv(index=False, encoding="utf-8-sig"))
+        zf.writestr("tool_b1_report.json", json.dumps(res.report, ensure_ascii=False, indent=2))
+
+    st.download_button(
+        label="結果一式（ZIP）をダウンロード",
+        data=zip_buf.getvalue(),
+        file_name="tool_b1_outputs_ir_coverage.zip",
+        mime="application/zip",
+    )
+
+    with st.expander("report.json", expanded=False):
+        st.json(res.report)

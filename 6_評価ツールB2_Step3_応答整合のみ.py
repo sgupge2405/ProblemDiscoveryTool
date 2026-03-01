@@ -1,0 +1,177 @@
+# pages/6_評価ツールB2_Step3_応答整合のみ.py
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+from evaluation.loader import load_trials_from_uploaded_files
+from evaluation.tool_b2_step3 import run_tool_b2_step3_response_alignment_012
+
+
+st.set_page_config(page_title="評価ツールB2 Step3（応答整合のみ）", layout="wide")
+st.title("評価ツールB2 Step3（応答整合：0/1/2 + 理由）のみ")
+
+st.caption(
+    "自動インタビューの run_*.zip をアップロードし，Step3（応答整合）だけを実行して "
+    "alignment.csv / alignment_detail.csv（＋jsonlログ）を生成・確認します．"
+)
+
+# ----------------------------
+# 入力
+# ----------------------------
+st.subheader("入力（run_*.zip）")
+uploaded = st.file_uploader(
+    "run_*.zip を複数選択してアップロードしてください",
+    type=["zip"],
+    accept_multiple_files=True,
+)
+
+# ----------------------------
+# 設定
+# ----------------------------
+st.subheader("設定")
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    temperature = st.number_input("temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
+    max_retries = st.number_input("max_retries", min_value=0, max_value=5, value=2, step=1)
+
+with col2:
+    judge_prompt = st.text_input(
+        "judge prompt path",
+        value="prompts/tool_b2_response_alignment_012.txt",
+        help="Step3の0/1/2判定プロンプト",
+    ).strip()
+
+with col3:
+    default_out = f"outputs/tool_b2_step3_only/{datetime.now().strftime('%Y%m%d_%H%M%S')}/step3"
+    outputs_dir = st.text_input(
+        "outputs_dir（step3出力先）",
+        value=default_out,
+        help="alignment.csv / alignment_detail.csv / report.json / jsonl をここに保存します",
+    ).strip()
+
+st.divider()
+
+run_btn = st.button("Step3だけ実行", type="primary", disabled=not uploaded)
+
+# ----------------------------
+# 実行
+# ----------------------------
+if run_btn:
+    try:
+        with st.spinner("ZIPを読み込み中..."):
+            trials = load_trials_from_uploaded_files(uploaded)
+
+        st.success(f"読み込み成功：{len(trials)} サンプル（ZIP）")
+
+        with st.spinner("Step3（応答整合）を実行中..."):
+            res3 = run_tool_b2_step3_response_alignment_012(
+                trials,
+                judge_prompt_path=Path(judge_prompt),
+                outputs_dir=Path(outputs_dir),
+                temperature=float(temperature),
+                max_retries=int(max_retries),
+            )
+
+        st.success("Step3 完了")
+
+        # ----------------------------
+        # 表示（集計）
+        # ----------------------------
+        st.subheader("alignment_df（sample_id単位集計）")
+        st.dataframe(res3.alignment_df, use_container_width=True)
+
+        # 軽いサマリ
+        if not res3.alignment_df.empty and "alignment_rate" in res3.alignment_df.columns:
+            st.markdown("#### サマリ")
+            st.write(
+                {
+                    "n_samples": int(res3.alignment_df["sample_id"].nunique())
+                    if "sample_id" in res3.alignment_df.columns
+                    else int(len(res3.alignment_df)),
+                    "mean_alignment_rate": float(res3.alignment_df["alignment_rate"].mean()),
+                    "mean_score_mean": float(res3.alignment_df["score_mean"].mean())
+                    if "score_mean" in res3.alignment_df.columns
+                    else None,
+                    "mean_score2_rate": float(res3.alignment_df["score2_rate"].mean())
+                    if "score2_rate" in res3.alignment_df.columns
+                    else None,
+                }
+            )
+
+        # ----------------------------
+        # 表示（詳細）
+        # ----------------------------
+        st.subheader("alignment_detail_df（turn単位詳細）")
+
+        # フィルタ
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            sample_filter = st.selectbox(
+                "sample_idで絞り込み",
+                options=["(all)"] + (sorted(res3.alignment_detail_df["sample_id"].unique().tolist())
+                                   if not res3.alignment_detail_df.empty and "sample_id" in res3.alignment_detail_df.columns
+                                   else ["(all)"]),
+            )
+        with f2:
+            score_filter = st.multiselect("scoreで絞り込み", options=[0, 1, 2], default=[0, 1, 2])
+        with f3:
+            keyword = st.text_input("キーワード（question/answer/reason を部分一致）", value="").strip()
+
+        detail_df = res3.alignment_detail_df.copy()
+        if not detail_df.empty:
+            if sample_filter != "(all)" and "sample_id" in detail_df.columns:
+                detail_df = detail_df[detail_df["sample_id"] == sample_filter]
+            if "score" in detail_df.columns:
+                detail_df = detail_df[detail_df["score"].isin(score_filter)]
+            if keyword:
+                cols = [c for c in ["question", "answer", "reason"] if c in detail_df.columns]
+                if cols:
+                    mask = False
+                    for c in cols:
+                        mask = mask | detail_df[c].astype(str).str.contains(keyword, na=False)
+                    detail_df = detail_df[mask]
+
+        st.dataframe(detail_df, use_container_width=True, height=450)
+
+        # ----------------------------
+        # 参照先（出力場所）
+        # ----------------------------
+        st.subheader("出力先")
+        st.code(outputs_dir)
+
+        # ----------------------------
+        # ダウンロード
+        # ----------------------------
+        st.subheader("ダウンロード")
+
+        st.download_button(
+            "alignment.csv をダウンロード",
+            data=res3.alignment_df.to_csv(index=False, encoding="utf-8-sig"),
+            file_name="alignment.csv",
+            mime="text/csv",
+        )
+
+        st.download_button(
+            "alignment_detail.csv をダウンロード",
+            data=res3.alignment_detail_df.to_csv(index=False, encoding="utf-8-sig"),
+            file_name="alignment_detail.csv",
+            mime="text/csv",
+        )
+
+        st.download_button(
+            "report.json をダウンロード",
+            data=json.dumps(res3.report, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="report.json",
+            mime="application/json",
+        )
+
+    except Exception as e:
+        st.error("Step3の実行中にエラーが発生しました。")
+        st.exception(e)

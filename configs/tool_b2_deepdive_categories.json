@@ -1,0 +1,10 @@
+{
+  "deepdive_categories": [
+    { "key": "Situation", "name": "状況・出来事（Situation：Context + Episodes）" },
+    { "key": "Mindset", "name": "心情・価値観（Mindset：Emotions + Values）" },
+    { "key": "Actions", "name": "試行・障害（Actions：Attempts + Barriers）" },
+    { "key": "IdealState", "name": "理想状態（Ideal State）" },
+    { "key": "Extras", "name": "進行・確認・雑談（Extras）" }
+  ],
+  "entropy_exclude": ["Extras"]
+}

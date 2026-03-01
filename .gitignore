@@ -1,0 +1,9 @@
+venv/
+venv_old/
+__pycache__/
+*.pyc
+outputs/
+*.faiss
+*.log
+.DS_Store
+Software-Planning/
