@@ -7,3 +7,4 @@ outputs/
 *.log
 .DS_Store
 Software-Planning/
+.env
