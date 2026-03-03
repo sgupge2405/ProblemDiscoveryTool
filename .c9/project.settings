@@ -39,11 +39,6 @@
         "@first": true
     },
     "workspace": {
-        "@folders": [
-            {
-                "name": "Software-Planning",
-                "path": "/Software-Planning"
-            }
-        ]
+        "@folders": []
     }
 }
